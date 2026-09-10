@@ -8,6 +8,8 @@ export interface StackChild {
   ready: boolean;
   running: boolean;
   restarts: number;
+  /** True while the Settings page has this child mid-restart with a new choice. */
+  restarting: boolean;
   /** Download progress, e.g. "1.2 GB" — present while a model is downloading. */
   detail?: string;
 }

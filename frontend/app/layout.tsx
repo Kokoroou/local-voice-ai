@@ -1,5 +1,7 @@
 import { Public_Sans } from 'next/font/google';
 import localFont from 'next/font/local';
+import Link from 'next/link';
+import { GearIcon } from '@phosphor-icons/react/dist/ssr';
 import { APP_CONFIG_DEFAULTS } from '@/app-config';
 import { ThemeProvider } from '@/components/app/theme-provider';
 import { ThemeToggle } from '@/components/app/theme-toggle';
@@ -70,6 +72,15 @@ export default function RootLayout({ children }: RootLayoutProps) {
           disableTransitionOnChange
         >
           {children}
+          <div className="fixed top-6 right-6 z-50">
+            <Link
+              href="/settings"
+              className="text-foreground bg-background hover:bg-accent flex size-9 items-center justify-center rounded-full border transition-colors"
+            >
+              <span className="sr-only">Settings</span>
+              <GearIcon weight="bold" className="size-4" />
+            </Link>
+          </div>
           <div className="group fixed bottom-0 left-1/2 z-50 mb-2 -translate-x-1/2">
             <ThemeToggle className="translate-y-20 transition-transform delay-150 duration-300 group-hover:translate-y-0" />
           </div>

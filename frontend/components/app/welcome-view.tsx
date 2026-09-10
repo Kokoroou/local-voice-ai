@@ -3,7 +3,7 @@ import { Button } from '@/components/livekit/button';
 import type { StackChild } from '@/hooks/useStackStatus';
 
 // Human labels for the supervisor's child process names (see /api/status).
-const CHILD_LABELS: Record<string, string> = {
+export const CHILD_LABELS: Record<string, string> = {
   livekit: 'WebRTC server',
   llama: 'Language model',
   nemotron: 'Speech-to-text',
