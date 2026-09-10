@@ -135,6 +135,21 @@ def server_argv(
     ]
 
 
+def _execve_env(binary: str) -> dict[str, str]:
+    """Env for exec'ing ``binary``, with its bundled lib dir on LD_LIBRARY_PATH.
+
+    Scoped to just this exec (rather than a container-wide Dockerfile ENV):
+    the bundled libstdc++ here is older than the one llama-server and other
+    siblings need, so putting it on the ambient LD_LIBRARY_PATH would shadow
+    the system libstdc++ for every process, not just this one.
+    """
+    lib_dir = str(Path(binary).resolve().parent.parent / "lib")
+    env = dict(os.environ)
+    existing = env.get("LD_LIBRARY_PATH")
+    env["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else lib_dir
+    return env
+
+
 def resolve_binary() -> str:
     """Find the nemo-speech binary, or explain how to install it.
 
@@ -193,17 +208,18 @@ def main(argv: list[str] | None = None) -> int:
     device = os.getenv("STT_DEVICE") or os.getenv("DEVICE", "cpu")
     configured_gpu = os.getenv("NEMOTRON_CPP_GPU")
     gpu = int(configured_gpu) if configured_gpu else (-1 if device == "cpu" else 0)
+    binary = resolve_binary()
     command = server_argv(
         model,
         host=args.host,
         port=args.port,
         right_context=args.right_context,
         gpu=gpu,
-        binary=resolve_binary(),
+        binary=binary,
     )
     logger.info("starting NeMo-Speech.cpp")
-    os.execvp(command[0], command)
-    return 0  # pragma: no cover - execvp either replaces the process or raises
+    os.execve(command[0], command, _execve_env(binary))
+    return 0  # pragma: no cover - execve either replaces the process or raises
 
 
 if __name__ == "__main__":

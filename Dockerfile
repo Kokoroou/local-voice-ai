@@ -112,8 +112,13 @@ RUN ln -s /usr/local/lib/llama/llama-server /usr/local/bin/llama-server \
     && ldconfig
 COPY --from=livekit-bin /livekit-server /usr/local/bin/livekit-server
 COPY --from=nemo-speech-bin /opt/nemo-speech /opt/nemo-speech
-ENV PATH=/opt/nemo-speech/bin:${PATH} \
-    LD_LIBRARY_PATH=/opt/nemo-speech/lib:${LD_LIBRARY_PATH}
+# PATH only: /opt/nemo-speech/lib bundles its own libstdc++, older than the
+# one llama-server needs. Making that dir globally LD_LIBRARY_PATH-visible
+# shadows the system libstdc++ for every process (llama-server included),
+# which crashes it at startup with missing GLIBCXX symbols. The launcher
+# (services/nemotron_cpp/launcher.py) sets LD_LIBRARY_PATH itself, scoped to
+# only the nemo-speech process it execve()s into.
+ENV PATH=/opt/nemo-speech/bin:${PATH}
 
 # Drop in the static-exported frontend
 COPY --from=frontend /app/out /app/frontend/out
