@@ -21,9 +21,11 @@ import httpx
 import uvicorn
 from dotenv import load_dotenv
 
+from . import settings_store
 from .api import build_app
-from .config import Config, probe_host
+from .config import Config, probe_host, settings_path_from_env
 from .profiles import detect_hardware, load_catalog, load_selection, resolve_profile
+from .settings import SettingsController
 from .supervisor import ChildSpec, Supervisor, configure_logging
 
 logger = logging.getLogger("main")
@@ -304,6 +306,12 @@ def _build_specs(cfg: Config) -> list[ChildSpec]:
                         "--port",
                         str(cfg.stt_bind_port),
                     ],
+                    # The launcher reads STT_LANGUAGE itself (it picks the
+                    # English or multilingual model from it) — spelling it out
+                    # here, rather than leaving it to inherited environment,
+                    # is what lets SettingsController notice a language change
+                    # and restart this child instead of silently no-op'ing.
+                    env={"STT_LANGUAGE": cfg.stt_language},
                     ready_url=(f"http://{probe_host(cfg.stt_bind_host)}:{cfg.stt_bind_port}/ready"),
                     ready_timeout=600.0,
                 )
@@ -400,7 +408,12 @@ async def _serve(cfg: Config) -> int:
     )
 
     status_provider = make_status_provider(supervisor, cfg)
-    app = build_app(cfg, status_provider=status_provider)
+    settings_controller = SettingsController(
+        supervisor=supervisor,
+        settings_path=Path(cfg.settings_path),
+        specs_builder=_build_specs,
+    )
+    app = build_app(cfg, status_provider=status_provider, settings_controller=settings_controller)
     uv_config = uvicorn.Config(
         app,
         host=cfg.web_host,
@@ -550,18 +563,31 @@ def _apply_profile_defaults(path: Path = Path(".local-voice-ai.toml")) -> None:
 
 
 def _load_env_files() -> None:
-    """Load ``.env.local`` then ``.env`` into the environment.
+    """Load ``.env.local`` then ``.env`` into the environment, then apply any
+    Settings-UI choice on top.
 
-    Under Docker, compose injects these via ``env_file:`` and this is a no-op.
-    On a bare-metal run nothing read them at all, so the documented settings
-    silently did nothing unless you exported them by hand.
+    Under Docker, compose injects ``.env``/``.env.local`` via ``env_file:``
+    *and* bakes each documented variable into ``environment:`` as
+    ``${VAR:-default}`` — which means, for every such variable, the container
+    process starts with the key **already present** in ``os.environ`` (as the
+    interpolated default, if nothing else set it) before this function runs
+    at all. ``setdefault``-style layering can never win against that: the key
+    already exists, regardless of its value.
 
-    Precedence is real env > ``.env.local`` > saved profile > ``.env``:
-    ``override=False`` means the first value wins, so an explicit
-    ``FOO=bar python -m ...`` still beats every file, and ``.env.local``
-    (untracked, per-machine) beats the committed defaults. Values reach the
-    children through the inherited environment, so llama.cpp's own
-    ``LLAMA_ARG_*`` vars work here too.
+    So, absent a Settings-UI choice: real env > ``.env.local`` > saved
+    profile > ``.env`` (via ``override=False``/``setdefault`` below — an
+    explicit ``FOO=bar python -m ...`` beats every file, and ``.env.local``
+    beats the committed defaults). But a Settings-UI choice, once made, beats
+    all of those *including real env* for its own key: it's applied as an
+    unconditional override, last. That's a deliberate trade, not an
+    oversight — it's the only way it can survive a container restart (Docker
+    can't be made to tell "its own baked-in default" apart from "a genuine
+    real override" — both just look like a pre-existing key), and it matches
+    what a user would expect: a choice made through the UI should stick until
+    changed again through the UI, not get silently re-clobbered by whatever
+    ``docker compose up`` happened to bake in this time.
+    Values reach the children through the inherited environment, so
+    llama.cpp's own ``LLAMA_ARG_*`` vars work here too.
 
     The profile sits above ``.env`` because it is chosen for this machine's
     hardware, while ``.env`` only carries repository-wide fallbacks.
@@ -571,6 +597,7 @@ def _load_env_files() -> None:
     _apply_profile_defaults()
     if Path(".env").is_file():
         load_dotenv(Path(".env"), override=False)
+    os.environ.update(settings_store.load(settings_path_from_env()))
 
 
 def main(argv: list[str] | None = None) -> int:

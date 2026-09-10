@@ -22,6 +22,7 @@ import httpx
 import pytest
 
 import local_voice_ai.__main__ as main_mod
+from local_voice_ai import settings_store
 from local_voice_ai.__main__ import (
     _build_specs,
     _hf_hub_dir,
@@ -546,3 +547,31 @@ class TestEnvFileLoading:
     ) -> None:
         monkeypatch.chdir(tmp_path)
         _load_env_files()  # no .env or .env.local present
+
+    def test_persisted_setting_beats_a_pre_seeded_real_env_value(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # This is the Docker case: `environment: {STT_LANGUAGE: ${STT_LANGUAGE:-en}}`
+        # means the key is already present in os.environ (as "en", Compose's own
+        # interpolated default) before this function ever runs — identical, from
+        # Python's view, to a genuine real override. A Settings-UI choice must
+        # win anyway, or it could never survive a container restart.
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("SETTINGS_PATH", str(tmp_path / "settings.json"))
+        monkeypatch.setenv("STT_LANGUAGE", "en")  # stands in for Compose's baked default
+        settings_store.save(tmp_path / "settings.json", {"STT_LANGUAGE": "fr-FR"})
+
+        _load_env_files()
+
+        assert os.environ["STT_LANGUAGE"] == "fr-FR"
+
+    def test_no_persisted_settings_leaves_real_env_untouched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("SETTINGS_PATH", str(tmp_path / "settings.json"))
+        monkeypatch.setenv("STT_LANGUAGE", "de")
+
+        _load_env_files()  # no settings.json written
+
+        assert os.environ["STT_LANGUAGE"] == "de"

@@ -27,6 +27,7 @@ from livekit import api as lk_api
 from starlette.background import BackgroundTask
 
 from .config import Config
+from .settings import SettingsController, SettingsError
 
 logger = logging.getLogger("api")
 
@@ -220,6 +221,7 @@ def _mount_gateway(app: FastAPI, cfg: Config) -> None:
 def build_app(
     cfg: Config,
     status_provider: Callable[[], list[dict[str, Any]]] | None = None,
+    settings_controller: SettingsController | None = None,
 ) -> FastAPI:
     app = FastAPI(title="local-voice-ai", version="0.1.0", lifespan=_gateway_lifespan(cfg))
     app.add_middleware(
@@ -242,8 +244,12 @@ def build_app(
         return {
             "ready": all(c["ready"] for c in children),
             "children": children,
-            # Lets the frontend hint "say the wake phrase" when enabled.
-            "wake_word": cfg.wake_word,
+            # Lets the frontend hint "say the wake phrase" when enabled. Read
+            # fresh rather than from the closed-over `cfg`: the Settings UI
+            # updates os.environ live, and `cfg` here is only ever built once
+            # at startup, so it would otherwise show a stale value after a
+            # wake-word change until the whole app restarts.
+            "wake_word": Config.from_env().wake_word,
         }
 
     @app.post("/api/connection-details")
@@ -271,6 +277,26 @@ def build_app(
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
+    if settings_controller is not None:
+
+        @app.get("/api/config")
+        async def get_config() -> JSONResponse:
+            return JSONResponse(settings_controller.snapshot())
+
+        @app.post("/api/config")
+        async def post_config(request: Request) -> JSONResponse:
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail="body must be a JSON object")
+            try:
+                result = settings_controller.apply(body)
+            except SettingsError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return JSONResponse({"restarting": result.restarted}, status_code=202)
+
     if cfg.gateway:
         _mount_gateway(app, cfg)
 
@@ -280,9 +306,24 @@ def build_app(
 
         @app.get("/{path:path}")
         async def spa(path: str, request: Request) -> Any:
-            try:
-                return await static.get_response(path or "index.html", request.scope)
-            except Exception:
-                return FileResponse(f"{cfg.frontend_dir}/index.html")
+            # `next export` (trailingSlash: false) writes "/settings" as
+            # settings.html, not settings/index.html — a bare path 404s in
+            # StaticFiles, so try the .html file before falling back to the
+            # SPA shell. Otherwise a hard refresh / direct link to any page
+            # other than "/" silently renders the home page instead.
+            #
+            # StaticFiles(html=True) does NOT raise on a miss — it returns its
+            # own 404.html response with status_code=404 — so a bare
+            # try/except here would never reach the next candidate. Check the
+            # status instead.
+            candidates = (path, f"{path}.html", "index.html") if path else ("index.html",)
+            for candidate in candidates:
+                try:
+                    response = await static.get_response(candidate, request.scope)
+                except Exception:
+                    continue
+                if response.status_code != 404:
+                    return response
+            return FileResponse(f"{cfg.frontend_dir}/index.html")
 
     return app

@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from local_voice_ai.api import _GATEWAY_ROUTES, _upstream_url, build_app
 from local_voice_ai.config import Config
+from local_voice_ai.settings import ApplyResult, SettingsError
 
 
 def _decode_jwt_payload(token: str) -> dict:
@@ -40,6 +41,52 @@ class TestHealth:
         r = client.get("/healthz")
         assert r.status_code == 200
         assert r.json() == {"status": "ok"}
+
+
+class _FakeSettingsController:
+    """A duck-typed stand-in: api.py only ever calls snapshot()/apply()."""
+
+    def __init__(self) -> None:
+        self.applied: list[dict] = []
+
+    def snapshot(self) -> dict:
+        return {"current": {}, "platform_key": "linux-cpu", "profiles": []}
+
+    def apply(self, changes: dict) -> ApplyResult:
+        if "bad" in changes:
+            raise SettingsError("nope")
+        self.applied.append(changes)
+        return ApplyResult(restarted=["agent"])
+
+
+class TestConfigEndpoint:
+    def test_get_config_returns_the_snapshot(self, cfg: Config) -> None:
+        client = TestClient(build_app(cfg, settings_controller=_FakeSettingsController()))
+        r = client.get("/api/config")
+        assert r.status_code == 200
+        assert r.json()["platform_key"] == "linux-cpu"
+
+    def test_post_config_applies_and_returns_202_with_restarting_children(
+        self, cfg: Config
+    ) -> None:
+        controller = _FakeSettingsController()
+        client = TestClient(build_app(cfg, settings_controller=controller))
+        r = client.post("/api/config", json={"STT_LANGUAGE": "fr-FR"})
+        assert r.status_code == 202
+        assert r.json() == {"restarting": ["agent"]}
+        assert controller.applied == [{"STT_LANGUAGE": "fr-FR"}]
+
+    def test_post_config_rejects_invalid_input_with_400(self, cfg: Config) -> None:
+        client = TestClient(build_app(cfg, settings_controller=_FakeSettingsController()))
+        r = client.post("/api/config", json={"bad": "1"})
+        assert r.status_code == 400
+        assert "nope" in r.json()["detail"]
+
+    def test_config_routes_are_absent_without_a_controller(self, client: TestClient) -> None:
+        # Bare API (tests, or a future caller that opts out) shouldn't expose
+        # settings mutation it has no controller to back.
+        assert client.get("/api/config").status_code == 404
+        assert client.post("/api/config", json={}).status_code == 404
 
 
 class TestStatus:
@@ -177,6 +224,14 @@ class TestStaticFrontend:
             (out / "favicon.ico").write_bytes(b"\x00\x00")
             (out / "_next").mkdir()
             (out / "_next" / "static.js").write_text("// stub")
+            # `next export` (trailingSlash: false) writes a top-level page as
+            # "<name>.html", not "<name>/index.html".
+            (out / "settings.html").write_text("<h1>SETTINGS</h1>")
+            # A real export always has this. StaticFiles(html=True) serves it
+            # (status_code=404, not a raised exception) instead of raising on
+            # a miss, once it exists — omitting it from the fixture would
+            # hide that behavior and let the SPA-fallback bug back in.
+            (out / "404.html").write_text("<h1>NOT FOUND</h1>")
             yield out
 
     @pytest.fixture
@@ -200,6 +255,16 @@ class TestStaticFrontend:
         r = client.get("/some/client-side/route")
         assert r.status_code == 200
         assert "HOME" in r.text
+
+    def test_direct_navigation_to_a_static_export_page_serves_that_page(
+        self, client: TestClient
+    ) -> None:
+        # A hard refresh / bookmark / typed URL for a real exported page
+        # (settings.html on disk, requested as bare "/settings") must render
+        # that page, not silently fall back to the SPA shell.
+        r = client.get("/settings")
+        assert r.status_code == 200
+        assert "SETTINGS" in r.text
 
     def test_api_route_still_wins_over_spa_fallback(self, client: TestClient) -> None:
         r = client.post("/api/connection-details", json={})
