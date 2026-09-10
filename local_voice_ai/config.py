@@ -13,34 +13,51 @@ from __future__ import annotations
 
 import ipaddress
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
+def _env_bool(name: str, default: bool, env: Mapping[str, str] | None = None) -> bool:
+    raw = (env if env is not None else os.environ).get(name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _env_bool_opt(name: str) -> bool | None:
+def _env_bool_opt(name: str, env: Mapping[str, str] | None = None) -> bool | None:
     """Like ``_env_bool`` but returns ``None`` when the var is unset, so callers
     can distinguish "not configured" (auto) from an explicit true/false."""
-    raw = os.getenv(name)
+    raw = (env if env is not None else os.environ).get(name)
     if raw is None:
         return None
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _env_int_opt(name: str) -> int | None:
-    raw = os.getenv(name)
+def _env_int_opt(name: str, env: Mapping[str, str] | None = None) -> int | None:
+    raw = (env if env is not None else os.environ).get(name)
     return int(raw) if raw else None
 
 
-def _env_csv(name: str) -> tuple[str, ...]:
-    raw = os.getenv(name, "")
+def _env_csv(name: str, env: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    raw = (env if env is not None else os.environ).get(name, "")
     return tuple(value.strip() for value in raw.split(",") if value.strip())
+
+
+def settings_path_from_env(env: Mapping[str, str] | None = None) -> Path:
+    """Where the Settings UI persists its overrides.
+
+    Defaults under XDG_CACHE_HOME (which the Dockerfile sets to ``/models`` —
+    an already-mounted named volume, so this persists across container
+    recreation with no docker-compose.yml changes) or ``~/.cache`` natively.
+    """
+    source = env if env is not None else os.environ
+    configured = source.get("SETTINGS_PATH")
+    if configured:
+        return Path(configured)
+    xdg_cache = source.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return Path(xdg_cache) / "local-voice-ai" / "settings.json"
 
 
 _DEFAULT_BIND_HOST = "127.0.0.1"
@@ -198,23 +215,32 @@ class Config:
     # on small unified-memory devices such as Jetson Orin Nano.
     sequential_startup: bool = False
     log_level: str = "INFO"
+    # Where the Settings UI persists its overrides (see settings_path_from_env).
+    settings_path: str = ""
 
     @classmethod
-    def from_env(cls) -> Config:
-        """Build the config from ``os.environ`` with sane defaults."""
+    def from_env(cls, env: Mapping[str, str] | None = None) -> Config:
+        """Build the config from ``env`` (``os.environ`` by default) with sane defaults.
+
+        Accepting an explicit mapping lets a caller validate a *proposed* set of
+        overrides — merge them into a copy of the real environment and try
+        building a ``Config`` from that — without mutating the live process
+        environment first (see ``local_voice_ai.settings.SettingsController``).
+        """
+        source = env if env is not None else os.environ
         # Managed inference children listen on loopback, so nothing is reachable
         # off-box by default. BIND_HOST widens all three at once (0.0.0.0 for the
         # whole LAN, or a specific NIC address to pick one interface); the
         # per-service *_BIND_HOST vars override it individually. These endpoints
         # have no auth — only widen this on a network you trust.
-        bind_host = os.getenv("BIND_HOST", _DEFAULT_BIND_HOST)
-        livekit_url = os.getenv("LIVEKIT_URL", cls.livekit_url)
-        livekit_public_url = os.getenv("LIVEKIT_PUBLIC_URL", cls.livekit_public_url)
-        llama_base_url = os.getenv("LLAMA_BASE_URL", cls.llama_base_url)
-        stt_base_url = os.getenv("STT_BASE_URL")
-        tts_base_url = os.getenv("TTS_BASE_URL", cls.tts_base_url)
+        bind_host = source.get("BIND_HOST", _DEFAULT_BIND_HOST)
+        livekit_url = source.get("LIVEKIT_URL", cls.livekit_url)
+        livekit_public_url = source.get("LIVEKIT_PUBLIC_URL", cls.livekit_public_url)
+        llama_base_url = source.get("LLAMA_BASE_URL", cls.llama_base_url)
+        stt_base_url = source.get("STT_BASE_URL")
+        tts_base_url = source.get("TTS_BASE_URL", cls.tts_base_url)
 
-        stt_provider = os.getenv("STT_PROVIDER", cls.stt_provider).lower()
+        stt_provider = source.get("STT_PROVIDER", cls.stt_provider).lower()
         if stt_base_url is None:
             stt_base_url = "http://127.0.0.1:8000/v1"
 
@@ -225,75 +251,78 @@ class Config:
         )
 
         return cls(
-            web_host=os.getenv("WEB_HOST", cls.web_host),
-            web_port=int(os.getenv("WEB_PORT", str(cls.web_port))),
-            frontend_dir=os.getenv("FRONTEND_DIR"),
-            client_origins=_env_csv("CLIENT_ORIGINS"),
-            gateway=_env_bool("GATEWAY", cls.gateway),
+            web_host=source.get("WEB_HOST", cls.web_host),
+            web_port=int(source.get("WEB_PORT", str(cls.web_port))),
+            frontend_dir=source.get("FRONTEND_DIR"),
+            client_origins=_env_csv("CLIENT_ORIGINS", source),
+            gateway=_env_bool("GATEWAY", cls.gateway, source),
             #
             livekit_url=livekit_url,
             livekit_public_url=livekit_public_url,
-            livekit_api_key=os.getenv("LIVEKIT_API_KEY", cls.livekit_api_key),
-            livekit_api_secret=os.getenv("LIVEKIT_API_SECRET", cls.livekit_api_secret),
-            livekit_bind_port=int(os.getenv("LIVEKIT_BIND_PORT", str(cls.livekit_bind_port))),
-            livekit_rtc_port=int(os.getenv("LIVEKIT_RTC_PORT", str(cls.livekit_rtc_port))),
-            livekit_udp_port=int(os.getenv("LIVEKIT_UDP_PORT", str(cls.livekit_udp_port))),
+            livekit_api_key=source.get("LIVEKIT_API_KEY", cls.livekit_api_key),
+            livekit_api_secret=source.get("LIVEKIT_API_SECRET", cls.livekit_api_secret),
+            livekit_bind_port=int(source.get("LIVEKIT_BIND_PORT", str(cls.livekit_bind_port))),
+            livekit_rtc_port=int(source.get("LIVEKIT_RTC_PORT", str(cls.livekit_rtc_port))),
+            livekit_udp_port=int(source.get("LIVEKIT_UDP_PORT", str(cls.livekit_udp_port))),
             # ICE candidates must carry an address the browser can reach, so
             # default it to the advertised host instead of making a LAN setup
             # remember a second variable.
-            livekit_node_ip=os.getenv("LIVEKIT_NODE_IP")
+            livekit_node_ip=source.get("LIVEKIT_NODE_IP")
             or _literal_ip(livekit_public_url or livekit_url)
             or cls.livekit_node_ip,
-            manage_livekit=_env_bool("MANAGE_LIVEKIT", _is_loopback(livekit_url)),
+            manage_livekit=_env_bool("MANAGE_LIVEKIT", _is_loopback(livekit_url), source),
             #
             llama_base_url=llama_base_url,
-            llama_model=os.getenv("LLAMA_MODEL", cls.llama_model),
-            llama_api_key=os.getenv("LLAMA_API_KEY", cls.llama_api_key),
-            llama_hf_repo=os.getenv("LLAMA_HF_REPO", cls.llama_hf_repo),
-            llama_model_path=os.getenv("LLAMA_MODEL_PATH", cls.llama_model_path),
-            llama_offline=_env_bool_opt("LLAMA_OFFLINE"),
-            llama_model_alias=os.getenv("LLAMA_MODEL_ALIAS", cls.llama_model_alias),
-            llama_ctx_size=int(os.getenv("LLAMA_CTX_SIZE", str(cls.llama_ctx_size))),
-            llama_parallel=int(os.getenv("LLAMA_PARALLEL", str(cls.llama_parallel))),
-            llama_n_gpu_layers=int(os.getenv("LLAMA_N_GPU_LAYERS", str(cls.llama_n_gpu_layers))),
-            llama_bind_port=int(os.getenv("LLAMA_BIND_PORT", str(cls.llama_bind_port))),
-            llama_bind_host=os.getenv("LLAMA_BIND_HOST", bind_host),
-            manage_llama=_env_bool("MANAGE_LLAMA", _is_loopback(llama_base_url)),
+            llama_model=source.get("LLAMA_MODEL", cls.llama_model),
+            llama_api_key=source.get("LLAMA_API_KEY", cls.llama_api_key),
+            llama_hf_repo=source.get("LLAMA_HF_REPO", cls.llama_hf_repo),
+            llama_model_path=source.get("LLAMA_MODEL_PATH", cls.llama_model_path),
+            llama_offline=_env_bool_opt("LLAMA_OFFLINE", source),
+            llama_model_alias=source.get("LLAMA_MODEL_ALIAS", cls.llama_model_alias),
+            llama_ctx_size=int(source.get("LLAMA_CTX_SIZE", str(cls.llama_ctx_size))),
+            llama_parallel=int(source.get("LLAMA_PARALLEL", str(cls.llama_parallel))),
+            llama_n_gpu_layers=int(
+                source.get("LLAMA_N_GPU_LAYERS", str(cls.llama_n_gpu_layers))
+            ),
+            llama_bind_port=int(source.get("LLAMA_BIND_PORT", str(cls.llama_bind_port))),
+            llama_bind_host=source.get("LLAMA_BIND_HOST", bind_host),
+            manage_llama=_env_bool("MANAGE_LLAMA", _is_loopback(llama_base_url), source),
             #
             stt_provider=stt_provider,
             stt_base_url=stt_base_url,
-            stt_model=os.getenv("STT_MODEL", default_stt_model),
-            stt_language=os.getenv("STT_LANGUAGE", cls.stt_language),
-            stt_api_key=os.getenv("STT_API_KEY", cls.stt_api_key),
-            stt_bind_port=int(os.getenv("STT_BIND_PORT", str(cls.stt_bind_port))),
-            stt_bind_host=os.getenv("STT_BIND_HOST", bind_host),
-            manage_stt=_env_bool("MANAGE_STT", _is_loopback(stt_base_url)),
-            nemotron_model_name=os.getenv("NEMOTRON_MODEL_NAME", cls.nemotron_model_name),
-            nemotron_model_id=os.getenv("NEMOTRON_MODEL_ID", cls.nemotron_model_id),
-            nemotron_fp16=_env_bool("NEMOTRON_FP16", cls.nemotron_fp16),
-            nemotron_itn=_env_bool("NEMOTRON_ITN", cls.nemotron_itn),
-            whisper_model=os.getenv("WHISPER_MODEL", cls.whisper_model),
-            stt_device=os.getenv("STT_DEVICE", cls.stt_device).lower(),
+            stt_model=source.get("STT_MODEL", default_stt_model),
+            stt_language=source.get("STT_LANGUAGE", cls.stt_language),
+            stt_api_key=source.get("STT_API_KEY", cls.stt_api_key),
+            stt_bind_port=int(source.get("STT_BIND_PORT", str(cls.stt_bind_port))),
+            stt_bind_host=source.get("STT_BIND_HOST", bind_host),
+            manage_stt=_env_bool("MANAGE_STT", _is_loopback(stt_base_url), source),
+            nemotron_model_name=source.get("NEMOTRON_MODEL_NAME", cls.nemotron_model_name),
+            nemotron_model_id=source.get("NEMOTRON_MODEL_ID", cls.nemotron_model_id),
+            nemotron_fp16=_env_bool("NEMOTRON_FP16", cls.nemotron_fp16, source),
+            nemotron_itn=_env_bool("NEMOTRON_ITN", cls.nemotron_itn, source),
+            whisper_model=source.get("WHISPER_MODEL", cls.whisper_model),
+            stt_device=source.get("STT_DEVICE", cls.stt_device).lower(),
             #
-            wake_word=_env_bool("WAKE_WORD", cls.wake_word),
-            wake_word_model=os.getenv("WAKE_WORD_MODEL", cls.wake_word_model),
+            wake_word=_env_bool("WAKE_WORD", cls.wake_word, source),
+            wake_word_model=source.get("WAKE_WORD_MODEL", cls.wake_word_model),
             wake_word_threshold=float(
-                os.getenv("WAKE_WORD_THRESHOLD", str(cls.wake_word_threshold))
+                source.get("WAKE_WORD_THRESHOLD", str(cls.wake_word_threshold))
             ),
             #
-            tts_provider=os.getenv("TTS_PROVIDER", cls.tts_provider).lower(),
+            tts_provider=source.get("TTS_PROVIDER", cls.tts_provider).lower(),
             tts_base_url=tts_base_url,
-            tts_voice=os.getenv("TTS_VOICE", cls.tts_voice),
-            tts_api_key=os.getenv("TTS_API_KEY", cls.tts_api_key),
-            tts_bind_port=int(os.getenv("TTS_BIND_PORT", str(cls.tts_bind_port))),
-            tts_bind_host=os.getenv("TTS_BIND_HOST", bind_host),
-            manage_tts=_env_bool("MANAGE_TTS", _is_loopback(tts_base_url)),
+            tts_voice=source.get("TTS_VOICE", cls.tts_voice),
+            tts_api_key=source.get("TTS_API_KEY", cls.tts_api_key),
+            tts_bind_port=int(source.get("TTS_BIND_PORT", str(cls.tts_bind_port))),
+            tts_bind_host=source.get("TTS_BIND_HOST", bind_host),
+            manage_tts=_env_bool("MANAGE_TTS", _is_loopback(tts_base_url), source),
             #
-            device=os.getenv("DEVICE", cls.device).lower(),
-            turn_detection=os.getenv("TURN_DETECTION", cls.turn_detection).lower(),
-            agent_idle_processes=_env_int_opt("AGENT_IDLE_PROCESSES"),
-            sequential_startup=_env_bool("SEQUENTIAL_STARTUP", cls.sequential_startup),
-            log_level=os.getenv("LOG_LEVEL", cls.log_level).upper(),
+            device=source.get("DEVICE", cls.device).lower(),
+            turn_detection=source.get("TURN_DETECTION", cls.turn_detection).lower(),
+            agent_idle_processes=_env_int_opt("AGENT_IDLE_PROCESSES", source),
+            sequential_startup=_env_bool("SEQUENTIAL_STARTUP", cls.sequential_startup, source),
+            log_level=source.get("LOG_LEVEL", cls.log_level).upper(),
+            settings_path=str(settings_path_from_env(source)),
         )
 
     @property
