@@ -130,13 +130,13 @@ class TestSpawnAndReady:
 
         # Before spawn: not running, not ready — the first-boot UI's view.
         assert sup.status() == [
-            {"name": "a", "ready": False, "running": False, "restarts": 0}
+            {"name": "a", "ready": False, "running": False, "restarts": 0, "restarting": False}
         ]
 
         try:
             await sup.start_all()
             assert sup.status() == [
-                {"name": "a", "ready": True, "running": True, "restarts": 0}
+                {"name": "a", "ready": True, "running": True, "restarts": 0, "restarting": False}
             ]
         finally:
             await sup.shutdown(timeout=3.0)
@@ -252,6 +252,69 @@ _FLIPPABLE_STUB = dedent(
         srv.serve_forever()
     """
 ).strip()
+
+
+class TestReplaceChild:
+    """The Settings UI applies a new STT/LLM/TTS choice through this path."""
+
+    @pytest.mark.asyncio
+    async def test_replace_child_swaps_in_the_new_spec(self) -> None:
+        port_a, port_b = _free_port(), _free_port()
+        sup = Supervisor([_http_child("a", port_a)])
+        await sup.start_all()
+        try:
+            old_pid = sup._children[0].process.pid  # type: ignore[union-attr]
+            await sup.replace_child("a", _http_child("a", port_b))
+
+            child = sup._children[0]
+            assert child.spec.name == "a"
+            assert child.ready is True
+            assert child.restarting is False
+            assert child.process is not None and child.process.pid != old_pid
+
+            async with httpx.AsyncClient(timeout=2.0) as c:
+                r = await c.get(f"http://127.0.0.1:{port_b}/")
+            assert r.status_code == 200
+        finally:
+            await sup.shutdown(timeout=3.0)
+
+    @pytest.mark.asyncio
+    async def test_replace_child_can_change_the_registered_name(self) -> None:
+        # Mirrors an STT provider swap: "nemotron" <-> "whisper" are different
+        # child identities, not just different args to the same one.
+        port_a, port_b = _free_port(), _free_port()
+        sup = Supervisor([_http_child("nemotron", port_a)])
+        await sup.start_all()
+        try:
+            await sup.replace_child("nemotron", _http_child("whisper", port_b))
+
+            assert [c["name"] for c in sup.status()] == ["whisper"]
+            assert sup._by_name["whisper"] is sup._children[0]
+            assert "nemotron" not in sup._by_name
+        finally:
+            await sup.shutdown(timeout=3.0)
+
+    @pytest.mark.asyncio
+    async def test_replace_child_failure_does_not_stop_the_supervisor(self) -> None:
+        port = _free_port()
+        sup = Supervisor([_http_child("a", port)])
+        await sup.start_all()
+        try:
+            bad_spec = ChildSpec(
+                name="a",
+                argv=[sys.executable, "-c", "import sys; sys.exit(1)"],
+                ready_url="http://127.0.0.1:1/",
+                ready_timeout=0.5,
+            )
+            with pytest.raises((RuntimeError, TimeoutError)):
+                await sup.replace_child("a", bad_spec)
+
+            assert sup.stopping is False
+            child = sup._children[0]
+            assert child.ready is False
+            assert child.restarting is False
+        finally:
+            await sup.shutdown(timeout=3.0)
 
 
 class TestUnhealthyRestart:

@@ -46,9 +46,14 @@ class _Child:
     process: asyncio.subprocess.Process | None = None
     restart_count: int = 0
     ready: bool = False
+    # Set for the duration of a Settings-UI-triggered replace_child(), so
+    # /api/status can show "applying" instead of a bare not-ready flicker.
+    restarting: bool = False
     pump_task: asyncio.Task | None = None
     watch_task: asyncio.Task | None = None
     health_task: asyncio.Task | None = None
+    # Guards replace_child() against overlapping calls for the same child.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class Supervisor:
@@ -56,6 +61,7 @@ class Supervisor:
         self, specs: list[ChildSpec], *, sequential_startup: bool = False
     ) -> None:
         self._children: list[_Child] = [_Child(spec=spec) for spec in specs]
+        self._by_name: dict[str, _Child] = {child.spec.name: child for child in self._children}
         self._sequential_startup = sequential_startup
         self._stop_event = asyncio.Event()
         self._http: httpx.AsyncClient | None = None
@@ -72,6 +78,7 @@ class Supervisor:
                 "ready": child.ready,
                 "running": bool(child.process and child.process.returncode is None),
                 "restarts": child.restart_count,
+                "restarting": child.restarting,
             }
             for child in self._children
         ]
@@ -118,36 +125,82 @@ class Supervisor:
         self._stop_event.set()
 
         for child in self._children:
-            if child.process and child.process.returncode is None:
-                logger.info("[%s] terminating", child.spec.name)
-                try:
-                    child.process.terminate()
-                except ProcessLookupError:
-                    pass
+            self._terminate_only(child)
 
         deadline = asyncio.get_running_loop().time() + timeout
         for child in self._children:
-            if not child.process:
-                continue
-            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
-            try:
-                await asyncio.wait_for(child.process.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                logger.warning("[%s] killing (did not exit in %.1fs)", child.spec.name, timeout)
-                try:
-                    child.process.kill()
-                except ProcessLookupError:
-                    pass
-                await child.process.wait()
+            await self._wait_or_kill(child, deadline)
 
         for child in self._children:
-            for task in (child.pump_task, child.watch_task, child.health_task):
-                if task and not task.done():
-                    task.cancel()
+            self._cancel_tasks(child)
 
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+
+    async def replace_child(self, old_name: str, spec: ChildSpec) -> None:
+        """Swap the child registered as ``old_name`` for a fresh ``spec``.
+
+        Used by the Settings UI to apply a new STT/LLM/TTS choice without
+        restarting the whole stack. ``spec.name`` may differ from
+        ``old_name`` — e.g. switching STT provider between the "nemotron"
+        and "whisper" child identities — in which case the child is re-keyed
+        rather than replaced in place.
+
+        Unlike ``_watch_exit``, a failure here (a bad manual model/provider
+        choice) must not set ``_stop_event``: it should only strand this one
+        child, not tear down everything else that's already running fine.
+        The caller is responsible for catching and reporting failures.
+        """
+        child = self._by_name[old_name]
+        async with child.lock:
+            child.restarting = True
+            try:
+                await self._stop_child(child)
+                if spec.name != old_name:
+                    del self._by_name[old_name]
+                    self._by_name[spec.name] = child
+                child.spec = spec
+                child.ready = False
+                child.restart_count = 0
+                await self._start(child)
+                await self._await_ready(child)
+            finally:
+                child.restarting = False
+
+    async def _stop_child(self, child: _Child, timeout: float = 10.0) -> None:
+        """Stop one child: SIGTERM, wait, SIGKILL if needed, cancel its tasks."""
+        self._terminate_only(child)
+        deadline = asyncio.get_running_loop().time() + timeout
+        await self._wait_or_kill(child, deadline)
+        self._cancel_tasks(child)
+
+    def _terminate_only(self, child: _Child) -> None:
+        if child.process and child.process.returncode is None:
+            logger.info("[%s] terminating", child.spec.name)
+            try:
+                child.process.terminate()
+            except ProcessLookupError:
+                pass
+
+    async def _wait_or_kill(self, child: _Child, deadline: float) -> None:
+        if not child.process:
+            return
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        try:
+            await asyncio.wait_for(child.process.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            logger.warning("[%s] killing (did not exit in %.1fs)", child.spec.name, remaining)
+            try:
+                child.process.kill()
+            except ProcessLookupError:
+                pass
+            await child.process.wait()
+
+    def _cancel_tasks(self, child: _Child) -> None:
+        for task in (child.pump_task, child.watch_task, child.health_task):
+            if task and not task.done():
+                task.cancel()
 
     # ---------------- internals ----------------
 

@@ -274,7 +274,13 @@ class TestServeFirstBoot:
 
                 assert first["ready"] is False
                 assert first["children"] == [
-                    {"name": "slow", "ready": False, "running": True, "restarts": 0}
+                    {
+                        "name": "slow",
+                        "ready": False,
+                        "running": True,
+                        "restarts": 0,
+                        "restarting": False,
+                    }
                 ]
 
                 # ...and flip to ready once the child passes its probe.
